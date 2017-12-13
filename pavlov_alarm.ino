@@ -1,3 +1,11 @@
+#include <TimeLib.h>
+#include <NtpClientLib.h>
+#include <SPI.h>
+#include <EthernetUdp.h>
+#include <Ethernet.h>
+#include <Dns.h>
+#include <Dhcp.h>
+
 #if defined(ESP8266)
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
 #else
@@ -12,7 +20,11 @@
 #include <WebServer.h>
 #endif
 
+#define UDP_SYNC    0
 #define UDP_ASYNC   1
+#define NTP_CLIENT  2
+
+#define NTP_TYPE    NTP_CLIENT
 
 #include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
 
@@ -43,6 +55,38 @@ byte outPacketBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing p
 byte inPacketBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
 unsigned int localPort = 2390; // local port to listen for UDP packets
 
+// Start NTP only after IP network is connected
+void onSTAGotIP(WiFiEventStationModeGotIP ipInfo) {
+  Serial.printf("Got IP: %s\r\n", ipInfo.ip.toString().c_str());
+  NTP.begin("pool.ntp.org", 1, true);
+  NTP.setInterval(63);
+  digitalWrite(LED_BUILTIN, LOW); // Turn on LED
+}
+
+// Manage network disconnection
+void onSTADisconnected(WiFiEventStationModeDisconnected event_info) {
+  Serial.printf("Disconnected from SSID: %s\n", event_info.ssid.c_str());
+  Serial.printf("Reason: %d\n", event_info.reason);
+  digitalWrite(LED_BUILTIN, HIGH); // Turn off LED
+  NTP.stop(); // NTP sync can be disabled to avoid sync errors
+}
+
+void processSyncEvent(NTPSyncEvent_t ntpEvent) {
+  if (ntpEvent) {
+    Serial.print("Time Sync error: ");
+    if (ntpEvent == noResponse)
+      Serial.println("NTP server not reachable");
+    else if (ntpEvent == invalidAddress)
+      Serial.println("Invalid NTP server address");
+  }
+  else {
+    Serial.print("Got NTP time: ");
+    Serial.println(NTP.getTimeDateString(NTP.getLastNTPSync()));
+  }
+}
+
+boolean syncEventTriggered = false; // True if a time even has been triggered
+NTPSyncEvent_t ntpEvent; // Last triggered eve
 
 
 void setup() {
@@ -50,6 +94,44 @@ void setup() {
   pinMode(CONTROL_PIN, OUTPUT);
   
   Serial.begin(9600);
+
+    #if NTP_TYPE == UDP_ASYNC
+  udp.onPacket([](AsyncUDPPacket packet) {
+    Serial.print("UDP Packet Type: ");
+    Serial.println(packet.isBroadcast()?"Broadcast":packet.isMulticast()?"Multicast":"Unicast");
+    
+    Serial.print("From: ");
+    Serial.print(packet.remoteIP());
+    Serial.print(":");
+    Serial.println(packet.remotePort());
+    
+    Serial.print("To: ");
+    Serial.print(packet.localIP());
+    Serial.print(":");
+    Serial.println(packet.localPort());
+    
+    Serial.print("Length: ");
+    Serial.println(packet.length());
+    Serial.println();
+
+    memcpy(inPacketBuffer, packet.data(), NTP_PACKET_SIZE);    
+    parsePacket();
+  });
+  #elif NTP_TYPE == UDP_SYNC
+    Serial.println("UDP: starting");
+    udp.begin(localPort);
+    Serial.print("Local port: ");
+    Serial.println(udp.localPort());
+  #else NTP_TYPE == NTP_CLIENT
+    static WiFiEventHandler e1, e2;
+    NTP.onNTPSyncEvent([](NTPSyncEvent_t event) {
+      ntpEvent = event;
+      syncEventTriggered = true;
+    });
+
+    e1 = WiFi.onStationModeGotIP(onSTAGotIP);// As soon WiFi is connected, start NTP Client
+    e2 = WiFi.onStationModeDisconnected(onSTADisconnected);
+  #endif
   
   //WiFiManager
   //Local intialization. Once its business is done, there is no need to keep it around
@@ -77,34 +159,7 @@ void setup() {
   dimmer.attach(0.010, adjust_brightness);
   // udp_handler.attach(10.0, ntpUnixTime);
 
-  #if defined(UDP_ASYNC)
-  udp.onPacket([](AsyncUDPPacket packet) {
-    Serial.print("UDP Packet Type: ");
-    Serial.println(packet.isBroadcast()?"Broadcast":packet.isMulticast()?"Multicast":"Unicast");
-    
-    Serial.print("From: ");
-    Serial.print(packet.remoteIP());
-    Serial.print(":");
-    Serial.println(packet.remotePort());
-    
-    Serial.print("To: ");
-    Serial.print(packet.localIP());
-    Serial.print(":");
-    Serial.println(packet.localPort());
-    
-    Serial.print("Length: ");
-    Serial.println(packet.length());
-    Serial.println();
 
-    memcpy(inPacketBuffer, packet.data(), NTP_PACKET_SIZE);    
-    parsePacket();
-  });
-  #else
-    Serial.println("UDP: starting");
-    udp.begin(localPort);
-    Serial.print("Local port: ");
-    Serial.println(udp.localPort());
-  #endif
   
   //Send unicast
   // udp.print("Hello Server!");
@@ -119,10 +174,35 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
-  
-  sendNtpPacket(timeServerIP); // send an NTP packet to a time server
 
-  #if !defined(UDP_ASYNC)
+  #if NTP_TYPE == NTP_CLIENT
+    static int i = 0;
+    static int last = 0;
+  
+    if (syncEventTriggered) {
+      processSyncEvent(ntpEvent);
+      syncEventTriggered = false;
+    }
+  
+    if ((millis() - last) > 5100) {
+      //Serial.println(millis() - last);
+      last = millis();
+      Serial.print(i); Serial.print(" ");
+      Serial.print(NTP.getTimeDateString()); Serial.print(" ");
+      Serial.print(NTP.isSummerTime() ? "Summer Time. " : "Winter Time. ");
+      Serial.print("WiFi is ");
+      Serial.print(WiFi.isConnected() ? "connected" : "not connected"); Serial.print(". ");
+      Serial.print("Uptime: ");
+      Serial.print(NTP.getUptimeString()); Serial.print(" since ");
+      Serial.println(NTP.getTimeDateString(NTP.getFirstSync()).c_str());
+  
+      i++;
+    }
+  #else
+    sendNtpPacket(timeServerIP); // send an NTP packet to a time server
+  #endif 
+
+  #if NTP_TYPE == UDP_ASYNC
   // wait to see if a reply is available
   delay(1000);  
   
@@ -144,7 +224,10 @@ void loop() {
   // wait ten seconds before asking for the time again
   }
   #endif
-  delay(10000 + 1000 * random(10, 20));
+
+  #if NTP_TYPE != NTP_CLIENT
+    delay(10000 + 1000 * random(10, 20));
+  #endif 
 }
 
 void configModeCallback(WiFiManager *myWiFiManager) {
